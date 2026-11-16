@@ -1,5 +1,5 @@
 import types
-from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Type, Union
+from typing import Any, Literal, Mapping, Optional, Sequence, Tuple, Type, Union, cast
 
 from ott.geometry import epsilon_scheduler
 
@@ -18,6 +18,10 @@ from moscot._types import (
 from moscot.base.problems.birth_death import BirthDeathMixin, BirthDeathProblem
 from moscot.base.problems.compound_problem import B, Callback_t
 from moscot.problems.space import AlignmentProblem, SpatialAlignmentMixin
+from moscot.problems.spatiotemporal._open_system import (
+    OpenSystemConfig,
+    OpenSystemProblem,
+)
 from moscot.problems.time import TemporalMixin
 
 __all__ = ["SpatioTemporalProblem"]
@@ -41,6 +45,7 @@ class SpatioTemporalProblem(  # type: ignore[misc]
 
     def __init__(self, adata: AnnData, **kwargs: Any):
         super().__init__(adata, **kwargs)
+        self._open_system: Optional[OpenSystemConfig] = None
 
     def prepare(
         self,
@@ -61,6 +66,7 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         xy_callback_kwargs: Mapping[str, Any] = types.MappingProxyType({}),
         x_callback_kwargs: Mapping[str, Any] = types.MappingProxyType({}),
         y_callback_kwargs: Mapping[str, Any] = types.MappingProxyType({}),
+        open_system: Optional[OpenSystemConfig] = None,
     ) -> "SpatioTemporalProblem":
         """Prepare the spatiotemporal problem problem.
 
@@ -129,6 +135,11 @@ class SpatioTemporalProblem(  # type: ignore[misc]
             Keyword arguments for :meth:`~moscot.base.problems.BirthDeathProblem.estimate_marginals`.
             It always contains :attr:`proliferation_key` and :attr:`apoptosis_key`,
             see :meth:`score_genes_for_marginals` for more information.
+        open_system
+            Opt into explicit recruitment and loss using :class:`OpenSystemConfig`.
+            Requires an explicit shared ``joint_attr`` obsm key; local PCA and expression callbacks
+            are disallowed. ``a`` and ``b`` are normalized baseline resident weights. Automatic
+            birth/death marginal estimation is disabled; specify proliferation in the configuration.
 
         Returns
         -------
@@ -146,7 +157,19 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         self.temporal_key = time_key
         marginal_kwargs = dict(marginal_kwargs)
 
-        estimate_marginals = self.proliferation_key is not None or self.apoptosis_key is not None
+        if open_system is not None:
+            if not isinstance(open_system, OpenSystemConfig):
+                raise TypeError("`open_system` must be an OpenSystemConfig.")
+            if not isinstance(joint_attr, str) or xy_callback is not None:
+                raise ValueError("Open-system transport requires a shared joint_attr obsm key and no xy_callback.")
+            if a is True or b is True or marginal_kwargs:
+                raise ValueError(
+                    "Use baseline a/b weights and OpenSystemConfig proliferation, not marginal estimation."
+                )
+        self._open_system = open_system
+        estimate_marginals = open_system is None and (
+            self.proliferation_key is not None or self.apoptosis_key is not None
+        )
         a = estimate_marginals if a is None else a
         b = estimate_marginals if b is None else b
         if self.apoptosis_key is not None:
@@ -154,7 +177,7 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         if self.proliferation_key is not None:
             marginal_kwargs["proliferation_key"] = self.proliferation_key
 
-        return super().prepare(  # type: ignore[return-value]
+        super().prepare(
             spatial_key=spatial_key,
             batch_key=time_key,
             joint_attr=joint_attr,
@@ -174,6 +197,12 @@ class SpatioTemporalProblem(  # type: ignore[misc]
             y_callback_kwargs=y_callback_kwargs,
             xy_callback_kwargs=xy_callback_kwargs,
         )
+        if open_system is not None:
+            assert isinstance(joint_attr, str)
+            for problem in self.problems.values():
+                assert isinstance(problem, OpenSystemProblem)
+                problem.configure(open_system, joint_attr=joint_attr, spatial_key=spatial_key)
+        return self
 
     def solve(
         self,
@@ -182,7 +211,7 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         tau_a: float = 1.0,
         tau_b: float = 1.0,
         rank: int = -1,
-        scale_cost: ScaleCost_t = "mean",
+        scale_cost: Optional[ScaleCost_t] = None,
         batch_size: Optional[int] = None,
         stage: Union[ProblemStage_t, Tuple[ProblemStage_t, ...]] = ("prepared", "solved"),
         initializer: QuadInitializer_t = None,
@@ -221,6 +250,8 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         scale_cost
             How to re-scale the cost matrices. If a :class:`float`, the cost matrices
             will be re-scaled as :math:`\frac{\text{cost}}{\text{scale_cost}}`.
+            Defaults to ``"mean"`` in the original mode and ``1.0`` in open-system mode.
+            Open-system mode rejects other values to keep all terms in explicit, consistent units.
         batch_size
             Number of rows/columns of the cost matrix to materialize during the solver iterations.
             Larger value will require more memory.
@@ -255,9 +286,11 @@ class SpatioTemporalProblem(  # type: ignore[misc]
         - :attr:`stage` - set to ``'solved'``.
         """
         # TODO(michalk8): use locals (and in other places)
+        if scale_cost is None:
+            scale_cost = 1.0 if getattr(self, "_open_system", None) is not None else "mean"
         return super().solve(  # type: ignore[return-value]
             alpha=alpha,
-            epsilon=epsilon,
+            epsilon=cast(float, epsilon),
             tau_a=tau_a,
             tau_b=tau_b,
             rank=rank,
@@ -286,4 +319,6 @@ class SpatioTemporalProblem(  # type: ignore[misc]
 
     @property
     def _base_problem_type(self) -> Type[B]:
+        if getattr(self, "_open_system", None) is not None:
+            return OpenSystemProblem  # type: ignore[return-value]
         return BirthDeathProblem  # type: ignore[return-value]

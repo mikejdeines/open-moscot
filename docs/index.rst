@@ -89,6 +89,7 @@ Important resources
     user/index
     developer/index
     ot_background
+    open_system
     notebooks/tutorials/index
     notebooks/examples/index
     contributing

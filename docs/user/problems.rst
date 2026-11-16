@@ -10,6 +10,7 @@ Biological Problems
     space.AlignmentProblem
     space.MappingProblem
     spatiotemporal.SpatioTemporalProblem
+    spatiotemporal.OpenSystemConfig
     cross_modality.TranslationProblem
 
 Generic Problems
